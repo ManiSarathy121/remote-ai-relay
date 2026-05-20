@@ -1,48 +1,49 @@
-// Remote AI Console - Relay Server v2
-// Supports both WebSocket (admin) and HTTP polling (extension client)
+// Remote AI Console - Relay Server v3
+// WebSocket for BOTH admin and client extension
+// HTTP polling fallback + /poll /result endpoints
 
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const COMMAND_TTL_MS = 30000;   // commands expire after 30s
-const SESSION_TTL_MS = 120000;  // sessions expire after 2min of no poll
+const SESSION_TTL_MS = 5 * 60 * 1000; // 5 min inactive cleanup
 
-// sessionId → { admin: ws|null, commands: [], results: {}, lastPoll: Date, created: Date }
+// sessionId → { client: ws|null, admin: ws|null, commands: [], lastSeen: Date }
 const sessions = new Map();
 
-function getOrCreateSession(id) {
+function getSession(id) {
   if (!sessions.has(id)) {
     sessions.set(id, {
-      admin: null,
-      commands: [],      // queue of pending commands for the client to pick up
-      results: {},       // commandId → result (for admin to pick up)
-      lastPoll: Date.now(),
-      created: new Date()
+      client: null,
+      admin:  null,
+      commands: [],
+      lastSeen: Date.now()
     });
   }
   return sessions.get(id);
 }
 
-// ─── Cleanup stale sessions every 60s ────────────────────────────────────────
+// ─── Session cleanup every 2 min ─────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
   for (const [id, sess] of sessions.entries()) {
-    if (now - sess.lastPoll > SESSION_TTL_MS && !sess.admin) {
+    const noClient = !sess.client || sess.client.readyState !== WebSocket.OPEN;
+    const noAdmin  = !sess.admin  || sess.admin.readyState  !== WebSocket.OPEN;
+    if (noClient && noAdmin && (now - sess.lastSeen) > SESSION_TTL_MS) {
       sessions.delete(id);
-      console.log('[relay] cleaned session:', id);
+      console.log('[relay] cleaned up session:', id);
     }
   }
-}, 60000);
+}, 120000);
 
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  // CORS
+  // CORS for all origins
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const json = (data, code = 200) => {
@@ -57,18 +58,30 @@ const server = http.createServer((req, res) => {
     req.on('error', reject);
   });
 
-  // ── GET /poll?sessionId=XXXX  (extension polls this) ───────────────────────
+  // ── GET /health ───────────────────────────────────────────────────────────
+  if (url.pathname === '/health') {
+    return json({ ok: true, sessions: sessions.size, uptime: Math.round(process.uptime()) });
+  }
+
+  // ── GET / ─────────────────────────────────────────────────────────────────
+  if (url.pathname === '/' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Remote AI Console Relay v3.0');
+    return;
+  }
+
+  // ── GET /poll?sessionId=XXXX  (HTTP fallback for extension) ──────────────
   if (req.method === 'GET' && url.pathname === '/poll') {
     const sid = url.searchParams.get('sessionId');
     if (!sid) return json({ error: 'Missing sessionId' }, 400);
 
-    const sess = getOrCreateSession(sid);
-    sess.lastPoll = Date.now();
+    const sess = getSession(sid);
+    sess.lastSeen = Date.now();
 
     // Drain pending commands
     const commands = sess.commands.splice(0);
 
-    // Notify admin client is alive
+    // Notify admin if connected via WS
     if (sess.admin?.readyState === WebSocket.OPEN) {
       sess.admin.send(JSON.stringify({ type: 'client_connected', sessionId: sid }));
     }
@@ -76,7 +89,7 @@ const server = http.createServer((req, res) => {
     return json({ ok: true, commands });
   }
 
-  // ── POST /result  (extension posts result back) ─────────────────────────────
+  // ── POST /result  (HTTP fallback — extension posts result) ────────────────
   if (req.method === 'POST' && url.pathname === '/result') {
     readBody().then(body => {
       const { sessionId: sid, commandId, result, generatedCode, ts } = body;
@@ -85,7 +98,7 @@ const server = http.createServer((req, res) => {
       const sess = sessions.get(sid);
       if (!sess) return json({ error: 'Unknown session' }, 404);
 
-      // Forward to admin via WebSocket
+      // Forward to admin
       if (sess.admin?.readyState === WebSocket.OPEN) {
         sess.admin.send(JSON.stringify({ type: 'result', commandId, sessionId: sid, result, generatedCode, ts }));
       }
@@ -95,116 +108,145 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── POST /command  (REST fallback for admin) ────────────────────────────────
-  if (req.method === 'POST' && url.pathname === '/command') {
-    readBody().then(body => {
-      const sess = sessions.get(body.sessionId);
-      if (!sess) return json({ error: 'Session not found' }, 404);
-
-      // Expire old commands
-      const now = Date.now();
-      sess.commands = sess.commands.filter(c => now - (c.ts || 0) < COMMAND_TTL_MS);
-
-      body.ts = now;
-      sess.commands.push(body);
-      json({ ok: true, commandId: body.commandId, queued: sess.commands.length });
-    }).catch(() => json({ error: 'Bad JSON' }, 400));
-    return;
-  }
-
-  // ── GET /sessions  (admin dashboard) ───────────────────────────────────────
+  // ── GET /sessions ─────────────────────────────────────────────────────────
   if (req.method === 'GET' && url.pathname === '/sessions') {
     const now = Date.now();
     const list = [];
     for (const [id, sess] of sessions.entries()) {
       list.push({
         id,
-        clientAlive: (now - sess.lastPoll) < 8000,
-        lastPollAgo: Math.round((now - sess.lastPoll) / 1000) + 's',
-        adminConnected: sess.admin?.readyState === WebSocket.OPEN,
+        clientConnected: sess.client?.readyState === WebSocket.OPEN,
+        adminConnected:  sess.admin?.readyState  === WebSocket.OPEN,
         pendingCommands: sess.commands.length,
+        lastSeenAgo: Math.round((now - sess.lastSeen) / 1000) + 's'
       });
     }
     return json(list);
   }
 
-  // ── GET /health ─────────────────────────────────────────────────────────────
-  if (url.pathname === '/health') {
-    return json({ ok: true, sessions: sessions.size, uptime: Math.round(process.uptime()) });
-  }
-
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Remote AI Console Relay v2.0');
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not found');
 });
 
-// ─── WebSocket (admin app uses this) ─────────────────────────────────────────
+// ─── WebSocket Server — handles BOTH client (extension) and admin ─────────────
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const sid = url.searchParams.get('sessionId');
-  const role = url.searchParams.get('role');
+  const url  = new URL(req.url, `http://localhost:${PORT}`);
+  const sid  = url.searchParams.get('sessionId');
+  const role = url.searchParams.get('role'); // 'client' or 'admin'
 
-  if (!sid || role !== 'admin') { ws.close(1008, 'Admin only'); return; }
-  console.log('[relay] admin connected:', sid);
+  if (!sid) { ws.close(1008, 'Missing sessionId'); return; }
+  if (role !== 'client' && role !== 'admin') { ws.close(1008, 'Invalid role — use client or admin'); return; }
 
-  const sess = getOrCreateSession(sid);
-  sess.admin = ws;
+  const sess = getSession(sid);
+  sess.lastSeen = Date.now();
 
-  // Tell admin current state
-  const now = Date.now();
-  ws.send(JSON.stringify({
-    type: 'session_state',
-    sessionId: sid,
-    clientConnected: (now - sess.lastPoll) < 8000
-  }));
+  console.log(`[relay] ${role} connected — session: ${sid}`);
 
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data);
+  // ── CLIENT (Chrome Extension) ─────────────────────────────────────────────
+  if (role === 'client') {
+    sess.client = ws;
 
-      if (msg.type === 'command') {
-        const s = getOrCreateSession(sid);
-        msg.ts = Date.now();
+    // Tell admin browser is connected
+    if (sess.admin?.readyState === WebSocket.OPEN) {
+      sess.admin.send(JSON.stringify({ type: 'client_connected', sessionId: sid }));
+    }
 
-        // Expire stale commands first
-        s.commands = s.commands.filter(c => Date.now() - (c.ts || 0) < COMMAND_TTL_MS);
-        s.commands.push(msg);
+    // Send any queued commands immediately
+    if (sess.commands.length > 0) {
+      const pending = sess.commands.splice(0);
+      pending.forEach(cmd => ws.send(JSON.stringify({ type: 'command', ...cmd })));
+    }
 
-        const clientAlive = (Date.now() - s.lastPoll) < 8000;
-        ws.send(JSON.stringify({
-          type: 'command_sent',
-          commandId: msg.commandId,
-          clientAlive
-        }));
+    ws.on('message', raw => {
+      try {
+        const msg = JSON.parse(raw);
+        sess.lastSeen = Date.now();
 
-        if (!clientAlive) {
-          ws.send(JSON.stringify({
-            type: 'error',
-            commandId: msg.commandId,
-            message: 'Client browser is not polling — extension may be asleep. It will pick up the command when it wakes (within 30s).'
-          }));
+        if (msg.type === 'result') {
+          // Forward result to admin
+          if (sess.admin?.readyState === WebSocket.OPEN) {
+            sess.admin.send(raw.toString());
+          }
         }
+      } catch(e) { console.error('[relay] client msg error:', e.message); }
+    });
+
+    ws.on('close', () => {
+      sess.client = null;
+      if (sess.admin?.readyState === WebSocket.OPEN) {
+        sess.admin.send(JSON.stringify({ type: 'client_disconnected', sessionId: sid }));
       }
+      console.log(`[relay] client disconnected — session: ${sid}`);
+    });
 
-      if (msg.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
-      }
-    } catch (e) { console.error('[relay] admin msg error:', e); }
-  });
+    ws.on('error', err => console.error(`[relay] client error [${sid}]:`, err.message));
+  }
 
-  ws.on('close', () => {
-    const s = sessions.get(sid);
-    if (s) s.admin = null;
-    console.log('[relay] admin disconnected:', sid);
-  });
+  // ── ADMIN (Admin App) ─────────────────────────────────────────────────────
+  if (role === 'admin') {
+    sess.admin = ws;
 
-  ws.on('error', err => console.error('[relay] ws error:', err));
+    // Tell admin current state
+    ws.send(JSON.stringify({
+      type: 'session_state',
+      sessionId: sid,
+      clientConnected: sess.client?.readyState === WebSocket.OPEN
+    }));
+
+    ws.on('message', raw => {
+      try {
+        const msg = JSON.parse(raw);
+        sess.lastSeen = Date.now();
+
+        if (msg.type === 'command') {
+          if (sess.client?.readyState === WebSocket.OPEN) {
+            // Client connected via WS — send directly
+            sess.client.send(raw.toString());
+            ws.send(JSON.stringify({ type: 'command_sent', commandId: msg.commandId, via: 'websocket' }));
+          } else {
+            // Queue for HTTP polling fallback
+            msg.ts = Date.now();
+            sess.commands.push(msg);
+            ws.send(JSON.stringify({
+              type: 'command_queued',
+              commandId: msg.commandId,
+              note: 'Client using HTTP poll — will pick up within 3s'
+            }));
+          }
+        }
+
+        if (msg.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+        }
+      } catch(e) { console.error('[relay] admin msg error:', e.message); }
+    });
+
+    ws.on('close', () => {
+      sess.admin = null;
+      console.log(`[relay] admin disconnected — session: ${sid}`);
+    });
+
+    ws.on('error', err => console.error(`[relay] admin error [${sid}]:`, err.message));
+  }
+
+  // ── Keepalive ping every 25s to prevent Render sleeping the WS ────────────
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 25000);
+
+  ws.on('close', () => clearInterval(pingInterval));
 });
 
 server.listen(PORT, () => {
-  console.log(`[relay] Remote AI Console Relay v2.0 on port ${PORT}`);
+  console.log(`[relay] Remote AI Console Relay v3.0 running on port ${PORT}`);
+  console.log(`[relay] WS client: ws://HOST?sessionId=XXXX&role=client`);
+  console.log(`[relay] WS admin:  ws://HOST?sessionId=XXXX&role=admin`);
   console.log(`[relay] HTTP poll: GET /poll?sessionId=XXXX`);
-  console.log(`[relay] HTTP result: POST /result`);
-  console.log(`[relay] WebSocket admin: ws://localhost:${PORT}?sessionId=XXXX&role=admin`);
+  console.log(`[relay] Health:    GET /health`);
 });
