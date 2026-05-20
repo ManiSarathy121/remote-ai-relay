@@ -57,34 +57,6 @@ const server = http.createServer((req, res) => {
     req.on('error', reject);
   });
 
-  // ── POST /claude  (proxies Claude API calls — fixes browser CORS issue) ────
-  if (req.method === 'POST' && url.pathname === '/claude') {
-    readBody().then(async body => {
-      const apiKey = req.headers['x-api-key'] || '';
-      if (!apiKey || !apiKey.startsWith('sk-ant-')) {
-        return json({ error: 'Missing or invalid Claude API key in x-api-key header' }, 401);
-      }
-      try {
-        // Use dynamic import for node-fetch or built-in fetch (Node 18+)
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01'
-          },
-          body: JSON.stringify(body)
-        });
-        const data = await response.json();
-        res.writeHead(response.status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(data));
-      } catch(e) {
-        json({ error: 'Claude proxy error: ' + e.message }, 500);
-      }
-    }).catch(() => json({ error: 'Bad JSON' }, 400));
-    return;
-  }
-
   // ── GET /poll?sessionId=XXXX  (extension polls this) ───────────────────────
   if (req.method === 'GET' && url.pathname === '/poll') {
     const sid = url.searchParams.get('sessionId');
